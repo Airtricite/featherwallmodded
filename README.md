@@ -14,6 +14,11 @@ rather than bolted on. One process, no browser engine, no launcher, no account.
 
 </div>
 
+## Modded
+
+<img width="2444" height="1295" alt=" 2026-10-09 020927" src="https://github.com/user-attachments/assets/6e192732-df60-473f-bdac-0b3bcf1b8355" />
+
+
 ![FeatherWall on a live wallpaper with the clock, the battery halo and the now-playing record](docs/media/widgets-hero.jpg)
 
 ---
