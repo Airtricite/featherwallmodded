@@ -41,6 +41,10 @@ public sealed class NowPlayingOverlay : IDisposable
     private readonly Lock _sync = new();
 
     private SIZE _size;
+
+    /// <summary>Where the record landed on screen, in virtual-screen pixels — edit mode outlines
+    /// and hit-tests from this.</summary>
+    public Rectangle ScreenBounds { get; private set; }
     private Bitmap? _face;
     private string? _faceTrackId;
 
@@ -194,11 +198,13 @@ public sealed class NowPlayingOverlay : IDisposable
 
             var size = new SIZE { Cx = metrics.Total.Width, Cy = metrics.Total.Height };
             var disc = _config.Disc;
-            var screenPos = ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, disc.Anchor,
-                ClockLayout.ScaleMargin(disc.MarginLeft ?? disc.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(disc.MarginTop ?? disc.MarginY, _dpiScale),
-                ClockLayout.ScaleMargin(disc.MarginRight ?? disc.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(disc.MarginBottom ?? disc.MarginY, _dpiScale));
+            var screenPos = ClockLayout.FreePosition(_monitor.WorkArea, disc.Placement)
+                ?? ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, disc.Anchor,
+                    ClockLayout.ScaleMargin(disc.MarginLeft ?? disc.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(disc.MarginTop ?? disc.MarginY, _dpiScale),
+                    ClockLayout.ScaleMargin(disc.MarginRight ?? disc.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(disc.MarginBottom ?? disc.MarginY, _dpiScale));
+            ScreenBounds = new Rectangle(screenPos.X, screenPos.Y, size.Cx, size.Cy);
             int offsetX = screenPos.X - _monitor.Bounds.Left;
             int offsetY = screenPos.Y - _monitor.Bounds.Top;
 

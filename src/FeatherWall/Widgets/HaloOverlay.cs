@@ -28,6 +28,10 @@ public sealed class HaloOverlay : IDisposable
     private bool _disposed;
     private bool _suspended;
 
+    /// <summary>Where the halo landed on screen, in virtual-screen pixels — edit mode outlines and
+    /// hit-tests from this.</summary>
+    public Rectangle ScreenBounds { get; private set; }
+
     public HaloOverlay(CompositionHost host, InfoConfig config, MonitorInfo monitor,
                        BatterySource battery, double dpiScale = 1.0)
     {
@@ -96,11 +100,13 @@ public sealed class HaloOverlay : IDisposable
             // Offsets are relative to the wallpaper window, whose origin is the monitor's top-left.
             // Margins scale with the monitor so the halo keeps the same physical inset on a display
             // with a different DPI.
-            var screenPos = ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, halo.Anchor,
-                ClockLayout.ScaleMargin(halo.MarginLeft ?? halo.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(halo.MarginTop ?? halo.MarginY, _dpiScale),
-                ClockLayout.ScaleMargin(halo.MarginRight ?? halo.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(halo.MarginBottom ?? halo.MarginY, _dpiScale));
+            var screenPos = ClockLayout.FreePosition(_monitor.WorkArea, halo.FreePlacement)
+                ?? ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, halo.Anchor,
+                    ClockLayout.ScaleMargin(halo.MarginLeft ?? halo.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(halo.MarginTop ?? halo.MarginY, _dpiScale),
+                    ClockLayout.ScaleMargin(halo.MarginRight ?? halo.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(halo.MarginBottom ?? halo.MarginY, _dpiScale));
+            ScreenBounds = new Rectangle(screenPos.X, screenPos.Y, size.Cx, size.Cy);
             int offsetX = screenPos.X - _monitor.Bounds.Left;
             int offsetY = screenPos.Y - _monitor.Bounds.Top;
 

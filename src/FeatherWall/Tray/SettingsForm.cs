@@ -62,6 +62,7 @@ public sealed class SettingsForm : Form
         AddPage(pages, rail, "Info", BuildInfoSection());
         AddPage(pages, rail, "Battery", BuildHaloSection());
         AddPage(pages, rail, "Music", BuildDiscSection());
+        AddPage(pages, rail, "Routine", BuildRoutineSection());
         AddPage(pages, rail, "Wallpaper", BuildWallpaperSection());
         AddPage(pages, rail, "Behaviour", BuildBehaviorSection());
         SelectPage(0);
@@ -197,6 +198,7 @@ public sealed class SettingsForm : Form
         {
             SetColor(CurrentRgb(), (int)Math.Round(v * 2.55));
             UpdateColorLabel();
+            _clockAlphaSync?.Invoke();
             ApplyClock();
         }, "%"));
 
@@ -223,7 +225,7 @@ public sealed class SettingsForm : Form
             v => { clock.DateMinFontSize = v; ApplyClock(); }, "px"));
         rows.AddRow("Colour", BuildDateColorPicker());
         rows.AddRow("Opacity", Spinner(10, 100, (int)Math.Round(clock.DateOpacity * 100),
-            v => { clock.DateOpacity = v / 100f; ApplyClock(); }, "% of time colour"));
+            v => { clock.DateOpacity = v / 100f; _dateAlphaSync?.Invoke(); ApplyClock(); }, "% of time colour"));
 
         return card;
     }
@@ -270,6 +272,14 @@ public sealed class SettingsForm : Form
         };
         reset.FlatAppearance.BorderColor = Theme.Colors.Border;
 
+        // An inherited date has no string of its own, so the alpha box edits the colour that is
+        // actually on screen, resolved the same way the renderer resolves it.
+        string LooseHex()
+        {
+            var c = Widgets.ClockRenderer.DateColorFor(_config.Clock, Widgets.ClockRenderer.ParseColor(_config.Clock.Color));
+            return $"#{c.A:X2}{c.R:X2}{c.G:X2}{c.B:X2}";
+        }
+
         void Sync()
         {
             bool inherited = string.IsNullOrWhiteSpace(_config.Clock.DateColor);
@@ -277,6 +287,7 @@ public sealed class SettingsForm : Form
             swatch.BackColor = Color.FromArgb(255, effective.R, effective.G, effective.B);
             label.Text = inherited ? "inherited" : _config.Clock.DateColor!.ToUpperInvariant();
             reset.Enabled = !inherited;
+            _dateAlphaSync?.Invoke();
         }
 
         swatch.Click += (_, _) =>
@@ -304,9 +315,15 @@ public sealed class SettingsForm : Form
         row.Controls.Add(swatch);
         row.Controls.Add(label);
         row.Controls.Add(reset);
+        _dateAlphaSync = AddAlphaEditor(row,
+            () => _config.Clock.DateColor ?? LooseHex(),
+            v => _config.Clock.DateColor = v,
+            () => { Sync(); ApplyClock(); });
         Sync();
         return row;
     }
+
+    private Action? _dateAlphaSync;
 
     private const string SameAsTime = "(same as time)";
 
@@ -338,6 +355,7 @@ public sealed class SettingsForm : Form
         {
             SetInfoColor(InfoRgb(), (int)Math.Round(v * 2.55));
             if (_infoColorHex is not null) _infoColorHex.Text = _config.Info.Color.ToUpperInvariant();
+            _infoAlphaSync?.Invoke();
             ApplyInfo();
         }, "%"));
 
@@ -461,7 +479,10 @@ public sealed class SettingsForm : Form
         return Palettes.Count;   // Custom
     }
 
-    private Control BuildHaloColorPicker(Func<string> get, Action<string> set)
+    /// <summary><paramref name="apply"/> defaults to the info widget's refresh because that is
+    /// where most of these pickers live; the routine preset passes its own, which has to re-apply
+    /// the wallpaper as well as the overlays.</summary>
+    private Control BuildHaloColorPicker(Func<string> get, Action<string> set, Action? apply = null)
     {
         var row = new FlowLayoutPanel
         {
@@ -509,12 +530,21 @@ public sealed class SettingsForm : Form
             // must not quietly make it opaque.
             set($"#{existing.A:X2}{dialog.Color.R:X2}{dialog.Color.G:X2}{dialog.Color.B:X2}");
             Refresh();
-            SyncPaletteCombo();
-            ApplyInfo();
+            // Only the halo's own pickers feed the palette dropdown; the routine page reuses this
+            // control and must not drag that selection around.
+            if (apply is null) SyncPaletteCombo();
+            (apply ?? ApplyInfo)();
         };
 
         row.Controls.Add(button);
         row.Controls.Add(hex);
+        // The palette presets rewrite these colours wholesale behind the rows' backs, so the
+        // alpha box joins the swatches in the refresh list.
+        _haloSwatchRefresh.Add(AddAlphaEditor(row, get, set, () =>
+        {
+            if (apply is null) SyncPaletteCombo();
+            (apply ?? ApplyInfo)();
+        }));
         return row;
     }
 
@@ -557,6 +587,265 @@ public sealed class SettingsForm : Form
         rows.AddRow("Margin Y", Spinner(0, 2000, disc.MarginY, v => { disc.MarginY = v; ApplyInfo(); }, "px"));
 
         return card;
+    }
+
+    // ---- routine preset -------------------------------------------------------------------
+
+    /// <summary>The routine preset's page. Position and size are not here: they are set by
+    /// dragging the blocks in edit mode, which is the only way to place them against a picture.</summary>
+    private Control BuildRoutineSection()
+    {
+        var (card, rows) = NewSection("Routine preset");
+        var routine = _config.Routine;
+
+        rows.AddRow("Show preset", Check(routine.Enabled, v => { routine.Enabled = v; _engine.RefreshRoutine(); }));
+        rows.AddRow("Background image", BuildRoutineBackground());
+        rows.AddRow("Start hour", Spinner(0, 23, routine.StartHour, v => { routine.StartHour = v; _engine.RefreshRoutine(); }, ":00"));
+        rows.AddRow("End hour", Spinner(0, 23, routine.EndHour, v => { routine.EndHour = v; _engine.RefreshRoutine(); }, ":59 — inclusive"));
+        rows.AddRow("24-hour digits", Check(routine.TwentyFourHour, v => { routine.TwentyFourHour = v; _engine.RefreshRoutine(); }));
+        rows.AddRow("Layout", BuildEditLayoutButton());
+        rows.AddRow("Presets", BuildRoutinePresets());
+
+        // The hour and the minute are styled apart on purpose, so each gets its own six rows.
+        BuildTextStyleRows(rows, "Hour digits", routine.HourDigits);
+        BuildTextStyleRows(rows, "Minute digits", routine.MinuteDigits);
+
+        rows.AddRow("Hour label text", TextInput(() => routine.HourLabel.Text, v => routine.HourLabel.Text = v));
+        rows.AddRow("Minute label text", TextInput(() => routine.MinuteLabel.Text, v => routine.MinuteLabel.Text = v));
+        BuildTextStyleRows(rows, "Label", routine.LabelStyle);
+        rows.AddRow("Label size", Spinner(1, 40, (int)Math.Round(routine.HourLabel.H * 100), v =>
+        {
+            // Both captions share one size control: they are one element split under two digits.
+            routine.HourLabel.H = routine.MinuteLabel.H = v / 100.0;
+            _engine.RefreshRoutine();
+        }, "× % of screen height"));
+
+        BuildProgressRows(rows, "Ring (seconds)", routine.RingStyle, arc: true);
+        BuildProgressRows(rows, "Day bar", routine.BarStyle, arc: false);
+
+        return card;
+    }
+
+    /// <summary>Font, gradient toggle, the two stops, the gradient angle and the opacity — the
+    /// six controls every piece of text in the preset shares.</summary>
+    private void BuildTextStyleRows(RowGrid rows, string caption, RoutineTextStyle style)
+    {
+        rows.AddRow($"{caption} font", BuildFontPicker(() => style.FontFamily, v => style.FontFamily = v, apply: _engine.RefreshRoutine));
+        rows.AddRow($"{caption} gradient", Check(style.Gradient, v => { style.Gradient = v; _engine.RefreshRoutine(); }));
+        rows.AddRow($"{caption} colour", BuildHaloColorPicker(() => style.Color, v => style.Color = v, _engine.RefreshRoutine));
+        rows.AddRow($"{caption} colour 2", BuildHaloColorPicker(() => style.Color2, v => style.Color2 = v, _engine.RefreshRoutine));
+        rows.AddRow($"{caption} gradient angle", Spinner(0, 359, (int)Math.Round(style.Angle), v => { style.Angle = v; _engine.RefreshRoutine(); }, "°"));
+        rows.AddRow($"{caption} opacity", Spinner(0, 100, style.Opacity, v => { style.Opacity = v; _engine.RefreshRoutine(); }, "%"));
+    }
+
+    /// <summary>Dropdown order, matching <see cref="ProgressStyle"/> member for member — the
+    /// selected index is used as the value, so the two must not drift.</summary>
+    private static readonly string[] ProgressStyleNames =
+        ["Solid", "Gradient", "Glow", "Dashed", "Segmented", "Hairline", "Chunky", "Comet", "Dots", "Duo", "Comet Glow", "Comet Glow Gradient"];
+
+    /// <summary>The controls the ring and the bar share: treatment, two colours, opacity, track
+    /// colour and opacity, and thickness. <paramref name="arc"/> adds the two arc angles, the two
+    /// end feathers and the lap retract — all of which only mean anything for the ring, because the
+    /// bar is a rail with a pointer on it and has no stroke of its own to shape or unwind.</summary>
+    private void BuildProgressRows(RowGrid rows, string caption, RoutineProgressStyle style, bool arc)
+    {
+        rows.AddRow($"{caption} style", Choice(ProgressStyleNames, (int)style.Style, v => { style.Style = (ProgressStyle)v; _engine.RefreshRoutine(); }));
+        rows.AddRow($"{caption} colour", BuildHaloColorPicker(() => style.Color, v => style.Color = v, _engine.RefreshRoutine));
+        rows.AddRow($"{caption} colour 2", BuildHaloColorPicker(() => style.Color2, v => style.Color2 = v, _engine.RefreshRoutine));
+        rows.AddRow($"{caption} opacity", Spinner(0, 100, style.Opacity, v => { style.Opacity = v; _engine.RefreshRoutine(); }, "%"));
+
+        if (arc)
+        {
+            // The arc is what makes the ring shapeable: a sweep of 180 in a wide block is the
+            // mirrored half; the block's own rotation in edit mode tilts it.
+            rows.AddRow($"{caption} start angle", Spinner(-360, 360, (int)Math.Round(style.StartAngle), v => { style.StartAngle = v; _engine.RefreshRoutine(); }, "° (0 = 3 o'clock)"));
+            rows.AddRow($"{caption} sweep angle", Spinner(-360, 360, (int)Math.Round(style.SweepAngle), v => { style.SweepAngle = v; _engine.RefreshRoutine(); }, "° (180 = half)"));
+
+            // The two ends of the stroke, each with a feather length and the opacity at its tip.
+            rows.AddRow($"{caption} head fade", Spinner(0, 100, style.HeadFade, v => { style.HeadFade = v; _engine.RefreshRoutine(); }, "% of the sweep"));
+            rows.AddRow($"{caption} head opacity", Spinner(0, 100, style.HeadOpacity, v => { style.HeadOpacity = v; _engine.RefreshRoutine(); }, "% at the tip"));
+            rows.AddRow($"{caption} tail fade", Spinner(0, 100, style.TailFade, v => { style.TailFade = v; _engine.RefreshRoutine(); }, "% of the sweep"));
+            rows.AddRow($"{caption} tail opacity", Spinner(0, 100, style.TailOpacity, v => { style.TailOpacity = v; _engine.RefreshRoutine(); }, "% at the tip"));
+            rows.AddRow($"{caption} lap retract", Spinner(0, 45, style.LoopRetract, v => { style.LoopRetract = v; _engine.RefreshRoutine(); }, "% of the minute (0 = hard cut)"));
+        }
+
+        rows.AddRow($"{caption} track", BuildHaloColorPicker(() => style.TrackColor, v => style.TrackColor = v, _engine.RefreshRoutine));
+        rows.AddRow($"{caption} track opacity", Spinner(0, 100, style.TrackOpacity, v => { style.TrackOpacity = v; _engine.RefreshRoutine(); }, "%"));
+        rows.AddRow($"{caption} thickness", Spinner(1, 80, (int)Math.Round(style.Thickness * 100), v => { style.Thickness = v / 100.0; _engine.RefreshRoutine(); }, "% of the short side"));
+    }
+
+    /// <summary>Save the whole layout under a name, or put a stored one back. Names live under
+    /// %AppData%\FeatherWall\routine-presets — see <see cref="Config.RoutinePresetStore"/>.</summary>
+    private Control BuildRoutinePresets()
+    {
+        var row = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.LeftToRight,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = Theme.Colors.Card,
+            Margin = new Padding(0, 2, 0, 2),
+        };
+
+        var name = new TextBox
+        {
+            Width = 130,
+            BackColor = Theme.Colors.Control,
+            ForeColor = Theme.Colors.Text,
+            BorderStyle = BorderStyle.FixedSingle,
+            Margin = new Padding(0, 3, 8, 3),
+        };
+        var list = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 150,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Theme.Colors.Control,
+            ForeColor = Theme.Colors.Text,
+            Margin = new Padding(0, 3, 8, 3),
+        };
+
+        void Reload()
+        {
+            var names = _engine.RoutinePresets();
+            list.Items.Clear();
+            list.Items.AddRange([.. names]);
+            if (names.Count > 0) list.SelectedIndex = 0;
+        }
+
+        Control Button(string caption, Action click)
+        {
+            var button = new Button
+            {
+                Text = caption,
+                Width = 62,
+                Height = 26,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Theme.Colors.Control,
+                ForeColor = Theme.Colors.Text,
+                Margin = new Padding(0, 1, 6, 1),
+            };
+            button.FlatAppearance.BorderColor = Theme.Colors.Border;
+            button.Click += (_, _) => click();
+            return button;
+        }
+
+        string Selected() => list.SelectedItem as string ?? "";
+
+        row.Controls.Add(Button("Save", () =>
+        {
+            // Falls back to the picked name, so "select then Save" overwrites rather than scolds.
+            var target = string.IsNullOrWhiteSpace(name.Text) ? Selected() : name.Text;
+            if (_engine.SaveRoutinePreset(target)) Reload();
+        }));
+        row.Controls.Add(Button("Load", () =>
+        {
+            if (Selected().Length > 0) _engine.LoadRoutinePreset(Selected());
+        }));
+        row.Controls.Add(Button("Delete", () =>
+        {
+            if (Selected().Length > 0 && _engine.DeleteRoutinePreset(Selected())) Reload();
+        }));
+        row.Controls.Add(name);
+        row.Controls.Add(list);
+
+        Reload();
+        return row;
+    }
+
+    /// <summary>A one-line text field that only commits on Enter or when it loses focus, so typing
+    /// does not rebuild the preset on every keystroke.</summary>
+    private Control TextInput(Func<string> get, Action<string> set)
+    {
+        var box = new TextBox
+        {
+            Text = get(),
+            Width = 190,
+            BackColor = Theme.Colors.Control,
+            ForeColor = Theme.Colors.Text,
+            BorderStyle = BorderStyle.FixedSingle,
+            Margin = new Padding(0, 3, 0, 3),
+        };
+        void Commit()
+        {
+            if (_loading) return;
+            if (box.Text == get()) return;
+            set(box.Text);
+            _engine.RefreshRoutine();
+        }
+        box.LostFocus += (_, _) => Commit();
+        box.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            Commit();
+        };
+        return box;
+    }
+
+
+    /// <summary>Choosing a picture switches the preset on and applies it as this monitor's
+    /// wallpaper — see <see cref="Engine.PickRoutineBackground"/>.</summary>
+    private Control BuildRoutineBackground()
+    {
+        var row = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.LeftToRight,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = Theme.Colors.Card,
+            Margin = new Padding(0, 2, 0, 2),
+        };
+
+        var path = new Label
+        {
+            AutoSize = true,
+            ForeColor = Theme.Colors.Subtle,
+            Margin = new Padding(0, 6, 10, 0),
+            MaximumSize = new Size(ContentWidth - LabelColumnWidth - 130, 0),
+            Text = DescribePath(_config.Routine.BackgroundImage),
+        };
+
+        var pick = new Button
+        {
+            Text = "Choose…",
+            Width = 96,
+            Height = 26,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Theme.Colors.Control,
+            ForeColor = Theme.Colors.Text,
+            Margin = new Padding(0, 0, 0, 0),
+        };
+        pick.FlatAppearance.BorderColor = Theme.Colors.Border;
+        pick.Click += (_, _) =>
+        {
+            _engine.PickRoutineBackground();
+            path.Text = DescribePath(_config.Routine.BackgroundImage);
+        };
+
+        row.Controls.Add(pick);
+        row.Controls.Add(path);
+        return row;
+    }
+
+    private static string DescribePath(string path) =>
+        string.IsNullOrWhiteSpace(path) ? "(none — using the current wallpaper)" : Path.GetFileName(path);
+
+    private Control BuildEditLayoutButton()
+    {
+        var button = new Button
+        {
+            Text = "Edit layout…",
+            Width = 140,
+            Height = 30,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Theme.Colors.Accent,
+            ForeColor = Color.White,
+        };
+        button.FlatAppearance.BorderSize = 0;
+        button.Click += (_, _) => _engine.OpenEditMode();
+        return button;
     }
 
     private bool HasSource(string name) =>
@@ -657,11 +946,20 @@ public sealed class SettingsForm : Form
         row.Controls.Add(button);
         row.Controls.Add(hex);
         _infoColorHex = hex;
+        _infoAlphaSync = AddAlphaEditor(row, () => _config.Info.Color, v =>
+        {
+            _config.Info.Color = v;
+            hex.Text = v.ToUpperInvariant();
+        }, ApplyInfo);
         return row;
     }
 
     /// <summary>Kept so the opacity spinner can refresh the hex, which carries the alpha byte.</summary>
     private Label? _infoColorHex;
+
+    /// <summary>Same spinner, same channel — the opacity row above rewrites the byte and this puts
+    /// the box back in step with it.</summary>
+    private Action? _infoAlphaSync;
 
     /// <summary>The info widget has no preview surface of its own, so unlike ApplyClock this
     /// only persists and rebuilds — what it looks like is checked on the desktop.</summary>
@@ -920,6 +1218,11 @@ public sealed class SettingsForm : Form
 
         row.Controls.Add(_colorButton);
         row.Controls.Add(_colorHex);
+        _clockAlphaSync = AddAlphaEditor(row, () => _config.Clock.Color, v =>
+        {
+            _config.Clock.Color = v;
+            UpdateColorLabel();
+        }, ApplyClock);
         UpdateColorLabel();
         return row;
     }
@@ -1074,6 +1377,57 @@ public sealed class SettingsForm : Form
         _config.Clock.Color = $"#{alpha:X2}{rgb.R:X2}{rgb.G:X2}{rgb.B:X2}";
 
     private void UpdateColorLabel() => _colorHex.Text = _config.Clock.Color.ToUpperInvariant();
+
+    private Action? _clockAlphaSync;
+
+    /// <summary>Appends an "α" spinner to a colour row, editing only the top byte of the
+    /// "#AARRGGBB" string.
+    ///
+    /// Every colour in FeatherWall carries its own alpha, but ColorDialog speaks RGB only, so
+    /// without this the alpha could be set from the palette presets or a JSON hand-edit and
+    /// nowhere else. Returns a sync action for the rows that own a second control writing the same
+    /// byte (the clock's and the info widget's opacity spinners), so the box never drifts out of
+    /// step with the colour it is showing.</summary>
+    private Action AddAlphaEditor(FlowLayoutPanel row, Func<string> get, Action<string> set, Action apply)
+    {
+        var caption = new Label
+        {
+            Text = "α",
+            AutoSize = true,
+            ForeColor = Theme.Colors.Subtle,
+            Margin = new Padding(0, 6, 4, 0),
+        };
+
+        var numeric = new NumericUpDown
+        {
+            Minimum = 0,
+            Maximum = 255,
+            Value = Math.Clamp((int)ClockRenderer.ParseColor(get()).A, 0, 255),
+            Width = 62,
+            BackColor = Theme.Colors.Control,
+            ForeColor = Theme.Colors.Text,
+            BorderStyle = BorderStyle.FixedSingle,
+            Margin = new Padding(0, 1, 0, 0),
+        };
+
+        numeric.ValueChanged += (_, _) =>
+        {
+            if (_loading) return;
+            var c = ClockRenderer.ParseColor(get());
+            set($"#{(int)numeric.Value:X2}{c.R:X2}{c.G:X2}{c.B:X2}");
+            apply();
+        };
+
+        Action sync = () =>
+        {
+            int alpha = ClockRenderer.ParseColor(get()).A;
+            if (numeric.Value != alpha) numeric.Value = alpha;
+        };
+
+        row.Controls.Add(caption);
+        row.Controls.Add(numeric);
+        return sync;
+    }
 
     private void ApplyClock()
     {

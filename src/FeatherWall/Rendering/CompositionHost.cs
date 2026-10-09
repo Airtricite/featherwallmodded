@@ -263,9 +263,22 @@ public sealed class CompositionSurface : IDisposable
 
     public void ClearBlack() => _host.Context.ClearRenderTargetView(Rtv, new Color4(0f, 0f, 0f, 1f));
 
+    /// <summary>Presents without ever blocking, which is a correctness requirement rather than a
+    /// speed one.
+    ///
+    /// With the default flags a flip-model present waits until DWM hands a back buffer back, and
+    /// DWM stops consuming frames from a swapchain it treats as occluded. Edit mode covers the
+    /// whole virtual screen with a topmost window, which is exactly that case: a widget's timer
+    /// thread could then sit inside Present indefinitely — holding that widget's render lock the
+    /// whole time, so the UI thread blocked behind it as well and the message pump stopped. That
+    /// is the freeze. DoNotWait turns the wait into a dropped frame.</summary>
     public void Present()
     {
-        var result = SwapChain.Present(0, PresentFlags.None);
+        // DXGI_STATUS_WAS_STILL_DRAWING: the previously presented frame has not been picked up
+        // yet. A skipped frame, not a failure — on a 33 ms timer the next one is already due.
+        var result = SwapChain.Present(0, PresentFlags.DoNotWait);
+        if (result.Code == Vortice.DXGI.ResultCode.WasStillDrawing.Code) return;
+
         if (result.Code == Vortice.DXGI.ResultCode.DeviceRemoved.Code ||
             result.Code == Vortice.DXGI.ResultCode.DeviceReset.Code)
         {
@@ -301,7 +314,15 @@ public sealed class CompositionSurface : IDisposable
                 new BitmapProperties(new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied)));
             _d2dTarget.BeginDraw();
             _d2dTarget.Clear(new Color4(0f, 0f, 0f, 0f));
-            _d2dTarget.DrawBitmap(d2dBitmap, new Rect(0, 0, Width, Height), 1f, Vortice.Direct2D1.BitmapInterpolationMode.Linear, null);
+            // A widget's bitmap is exactly its surface, so the blit is 1:1 and nearest-neighbour
+            // gives back the same pixels for less sampling work — which at sixty frames a second on
+            // six overlays is the difference between a filter that never does anything and one that
+            // runs over every source pixel of every frame. Anything that is not 1:1 still filters.
+            bool sameSize = bitmap.Width == Width && bitmap.Height == Height;
+            _d2dTarget.DrawBitmap(d2dBitmap, new Rect(0, 0, Width, Height), 1f,
+                sameSize
+                    ? Vortice.Direct2D1.BitmapInterpolationMode.NearestNeighbor
+                    : Vortice.Direct2D1.BitmapInterpolationMode.Linear, null);
             _d2dTarget.EndDraw();
         }
         finally

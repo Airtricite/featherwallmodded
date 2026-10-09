@@ -39,6 +39,10 @@ public sealed class InfoOverlay : IDisposable
     private bool _disposed;
     private bool _suspended;
 
+    /// <summary>Where the widget landed on screen, in virtual-screen pixels — edit mode outlines
+    /// and hit-tests from this rather than re-measuring the text itself.</summary>
+    public Rectangle ScreenBounds { get; private set; }
+
     /// <summary><paramref name="sources"/> is already ordered and resolved — the overlay renders
     /// whatever it is handed, in the order it is handed.</summary>
     public InfoOverlay(CompositionHost host, InfoConfig config, MonitorInfo monitor,
@@ -144,11 +148,13 @@ public sealed class InfoOverlay : IDisposable
             // Offsets are relative to the wallpaper window, whose origin is the monitor's
             // top-left. Margins scale with the monitor so the widget keeps the same physical
             // inset on a display with a different DPI.
-            var screenPos = ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, _config.Anchor,
-                ClockLayout.ScaleMargin(_config.MarginLeft ?? _config.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(_config.MarginTop ?? _config.MarginY, _dpiScale),
-                ClockLayout.ScaleMargin(_config.MarginRight ?? _config.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(_config.MarginBottom ?? _config.MarginY, _dpiScale));
+            var screenPos = ClockLayout.FreePosition(_monitor.WorkArea, _config.Placement)
+                ?? ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, _config.Anchor,
+                    ClockLayout.ScaleMargin(_config.MarginLeft ?? _config.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(_config.MarginTop ?? _config.MarginY, _dpiScale),
+                    ClockLayout.ScaleMargin(_config.MarginRight ?? _config.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(_config.MarginBottom ?? _config.MarginY, _dpiScale));
+            ScreenBounds = new Rectangle(screenPos.X, screenPos.Y, size.Cx, size.Cy);
             int offsetX = screenPos.X - _monitor.Bounds.Left;
             int offsetY = screenPos.Y - _monitor.Bounds.Top;
 

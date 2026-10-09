@@ -254,6 +254,9 @@ public static class Win32Constants
     public const uint GW_CHILD = 5;
 
     // Messages
+    /// <summary>Does nothing, which is the point: it is the cheapest way to ask another thread
+    /// whether it is still retrieving messages.</summary>
+    public const uint WM_NULL = 0x0000;
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_PAINT = 0x000F;
     public const uint WM_CLOSE = 0x0010;

@@ -19,11 +19,24 @@ public sealed class WallpaperAssignment
     public string Path { get; set; } = "";
 }
 
+/// <summary>Free placement written by edit mode: the widget's top-left corner as a fraction of
+/// the monitor's work area. Null (the default) means the widget is still positioned by its
+/// anchor and margins, so an untouched config renders exactly as it did before edit mode
+/// existed. Fractions rather than pixels so the placement survives a resolution change.</summary>
+public sealed class WidgetPlacement
+{
+    public double X { get; set; }
+    public double Y { get; set; }
+}
+
 public sealed class ClockConfig
 {
     public bool Enabled { get; set; } = true;
     public string Monitor { get; set; } = "*";
     public ClockAnchor Anchor { get; set; } = ClockAnchor.TopCenter;
+
+    /// <summary>Set by edit mode once the clock has been dragged. Overrides Anchor + margins.</summary>
+    public WidgetPlacement? Placement { get; set; }
     public int MarginX { get; set; } = 48;
     public int MarginY { get; set; } = 96;
 
@@ -84,6 +97,9 @@ public sealed class InfoConfig
     public bool Enabled { get; set; } = false;
     public string Monitor { get; set; } = "*";
     public ClockAnchor Anchor { get; set; } = ClockAnchor.BottomLeft;
+
+    /// <summary>Set by edit mode once the widget has been dragged.</summary>
+    public WidgetPlacement? Placement { get; set; }
     public int MarginX { get; set; } = 48;
     public int MarginY { get; set; } = 48;
 
@@ -124,6 +140,9 @@ public sealed class DiscConfig
     /// <summary>Its own anchor, independent of the info text and the halo — the record is its own
     /// block, not a line in a list.</summary>
     public ClockAnchor Anchor { get; set; } = ClockAnchor.BottomLeft;
+
+    /// <summary>Set by edit mode once the record has been dragged.</summary>
+    public WidgetPlacement? Placement { get; set; }
     public int MarginX { get; set; } = 48;
     public int MarginY { get; set; } = 48;
     public int? MarginLeft { get; set; }
@@ -165,6 +184,10 @@ public sealed class HaloConfig
     public HaloPlacement Placement { get; set; } = HaloPlacement.Left;
 
     public ClockAnchor Anchor { get; set; } = ClockAnchor.TopRight;
+
+    /// <summary>Set by edit mode once the halo has been dragged. Named apart from
+    /// <see cref="Placement"/>, which is the attached-mode side the halo sits on.</summary>
+    public WidgetPlacement? FreePlacement { get; set; }
     public int MarginX { get; set; } = 48;
     public int MarginY { get; set; } = 48;
     public int? MarginLeft { get; set; }
@@ -188,6 +211,178 @@ public sealed class HaloConfig
     public string TrackColor { get; set; } = "#24FFFFFF";
 }
 
+/// <summary>One block of the routine preset. Position and size are fractions of the monitor's
+/// work area, so the whole layout survives a resolution change and edit mode can write a dragged
+/// rectangle straight back without knowing anything about DPI.</summary>
+public sealed class RoutinePart
+{
+    public bool Enabled { get; set; } = true;
+    public double X { get; set; }
+    public double Y { get; set; }
+    public double W { get; set; } = 0.1;
+    public double H { get; set; } = 0.1;
+
+    /// <summary>Clockwise rotation in degrees about the block's own centre. Applied inside the
+    /// block's bitmap, so the composition surface stays axis-aligned and moving a rotated block
+    /// is still a plain offset.</summary>
+    public double Rotation { get; set; }
+
+    /// <summary>Caption for the block when it carries text of its own (the Hour/Min labels).
+    /// Ignored by the digit and progress blocks.</summary>
+    public string Text { get; set; } = "";
+}
+
+/// <summary>The accent treatments shared by the ring and the day bar. Every one of them answers the
+/// same question — "how much of the cycle is behind us" — with a different mark, so they are a
+/// single enum rather than two unrelated sets. The order is load-bearing: the settings page maps a
+/// dropdown index straight onto the value, so a new member goes on the end.</summary>
+public enum ProgressStyle
+{
+    Solid,
+    Gradient,
+    Glow,
+    Dashed,
+    Segmented,
+    Hairline,
+    Chunky,
+    Comet,
+    Dots,
+    Duo,
+    CometGlow,
+    CometGlowGradient,
+}
+
+/// <summary>Fill for the big hour/minute digits: a flat colour, or a two-stop gradient with a
+/// direction and a single opacity that scales both stops.</summary>
+public sealed class RoutineTextStyle
+{
+    public bool Gradient { get; set; } = false;
+    /// <summary>Flat colour, or the first gradient stop.</summary>
+    public string Color { get; set; } = "#F0FFFFFF";
+    /// <summary>Second gradient stop; unused when <see cref="Gradient"/> is false.</summary>
+    public string Color2 { get; set; } = "#8FB4FF";
+    /// <summary>Gradient direction in degrees: 0 points right, 90 points down.</summary>
+    public double Angle { get; set; } = 90;
+    /// <summary>0–100, applied on top of the colours' own alpha.</summary>
+    public int Opacity { get; set; } = 100;
+    public string FontFamily { get; set; } = "Segoe UI Light";
+}
+
+/// <summary>Colour, opacity, thickness and treatment for one progress element — the ring or the
+/// bar. Two instances rather than one so the ring and the bar can be styled apart.</summary>
+public sealed class RoutineProgressStyle
+{
+    public ProgressStyle Style { get; set; } = ProgressStyle.Solid;
+    public string Color { get; set; } = "#8FB4FF";
+    public string Color2 { get; set; } = "#F0FFFFFF";
+    /// <summary>0–100, applied on top of the colours' own alpha.</summary>
+    public int Opacity { get; set; } = 100;
+    public string TrackColor { get; set; } = "#33FFFFFF";
+    /// <summary>0–100, applied on top of the track colour's own alpha.</summary>
+    public int TrackOpacity { get; set; } = 100;
+    /// <summary>Bar/ring width as a fraction of the box's short side.</summary>
+    public double Thickness { get; set; } = 0.14;
+
+    // ---- arc geometry (the ring; ignored by the bar) ---------------------------------------
+    // The ring is an arc segment, not a full circle: an ellipse inscribed in the block, drawn
+    // from StartAngle through SweepAngle, with the block's own Rotation tilting it. A 180° sweep
+    // in a wide box is the "slanted half ellipse" case.
+
+    /// <summary>Degrees clockwise from 3 o'clock. -90 is the top.</summary>
+    public double StartAngle { get; set; } = -90;
+    /// <summary>Degrees of arc to draw. 360 closes the ring.</summary>
+    public double SweepAngle { get; set; } = 360;
+
+    // ---- the two ends of the stroke ---------------------------------------------------------
+    // Both feathers are measured as a percentage of the WHOLE sweep rather than of what happens to
+    // be drawn, so a feather keeps its angular size as the head advances along the arc instead of
+    // stretching with it. The two multiply where they overlap, which is what makes a short arc on
+    // a long feather meet in the middle rather than double up.
+    //
+    // The track carries them too, so a full lap lands on exactly the shape the empty ring already
+    // had: the stroke grows out of the track's soft tail and arrives at its soft head.
+
+    /// <summary>How far the leading end fades in, in percent of the sweep. 0 draws a hard tip.</summary>
+    public int HeadFade { get; set; } = 0;
+    /// <summary>Opacity at the very tip of the leading end, 0–100. Only reached when
+    /// <see cref="HeadFade"/> is non-zero.</summary>
+    public int HeadOpacity { get; set; } = 100;
+
+    /// <summary>How far the trailing end fades up from, in percent of the sweep.</summary>
+    public int TailFade { get; set; } = 0;
+    /// <summary>Opacity at the very tip of the trailing end, 0–100.</summary>
+    public int TailOpacity { get; set; } = 100;
+
+    /// <summary>Percent of the cycle the finished lap spends retracting.
+    ///
+    /// Without it the arc is deleted and redrawn the instant the minute turns — a full stroke one
+    /// frame, a bare track the next — which reads as a dropped frame rather than as a loop. Instead
+    /// the finished lap's head stays where it landed and its tail runs forward after it, so the
+    /// stroke unwinds into the endpoint it just reached while the new one grows out of the start
+    /// behind it; 0 is the old hard cut.
+    ///
+    /// Crossfading it out would have been the cheaper trick, but a lap that dims in place is still
+    /// a lap that vanishes. Retracting it is the same picture carried to its conclusion: the seam
+    /// becomes the motion the ring was already making.
+    ///
+    /// The ring only: the day bar is a rail with a pointer on it, and there is no stroke of its own
+    /// to unwind.</summary>
+    public int LoopRetract { get; set; } = 8;
+}
+
+/// <summary>The routine preset: a user-supplied background image with a schedule built on top of
+/// it — the hour and minute beside a character with a label under each, a ring that fills with the
+/// current second, and a timestamp bar marking where "now" sits between StartHour and EndHour.
+///
+/// Disabled by default, like the info widget, so an upgrade changes nothing until it is switched
+/// on. Every block is placed by edit mode.</summary>
+public sealed class RoutineConfig
+{
+    public bool Enabled { get; set; } = false;
+    public string Monitor { get; set; } = "*";
+
+    /// <summary>The picture the preset is drawn over. Applied as this monitor's wallpaper while
+    /// the preset is on; empty means whatever wallpaper is already assigned.</summary>
+    public string BackgroundImage { get; set; } = "";
+
+    /// <summary>Inclusive bounds: StartHour 8 means the day starts at 8:00:00, EndHour 23 means
+    /// it runs through 23:59:59, so the span is (EndHour - StartHour + 1) hours.</summary>
+    public int StartHour { get; set; } = 8;
+    public int EndHour { get; set; } = 23;
+
+    public bool TwentyFourHour { get; set; } = true;
+
+    /// <summary>The two digit blocks are styled apart on purpose: the reference design reads the
+    /// hour and the minute as different elements, and a single style could not say that.</summary>
+    public RoutineTextStyle HourDigits { get; set; } = new();
+    public RoutineTextStyle MinuteDigits { get; set; } = new()
+    {
+        Color = "#F0FFFFFF", Color2 = "#8FB4FF",
+    };
+
+    public RoutinePart Hour { get; set; } = new() { X = 0.255, Y = 0.280, W = 0.090, H = 0.110 };
+    public RoutinePart Minute { get; set; } = new() { X = 0.655, Y = 0.280, W = 0.090, H = 0.110 };
+    public RoutinePart HourLabel { get; set; } = new() { X = 0.245, Y = 0.398, W = 0.110, H = 0.026, Text = "HOUR" };
+    public RoutinePart MinuteLabel { get; set; } = new() { X = 0.645, Y = 0.398, W = 0.110, H = 0.026, Text = "MIN" };
+    public RoutinePart Ring { get; set; } = new() { X = 0.435, Y = 0.265, W = 0.130, H = 0.190 };
+    public RoutinePart Bar { get; set; } = new() { X = 0.200, Y = 0.790, W = 0.600, H = 0.070 };
+
+    public RoutineProgressStyle RingStyle { get; set; } = new()
+    {
+        Style = ProgressStyle.Comet, Color = "#8FB4FF", Color2 = "#F0FFFFFF", Thickness = 0.14,
+    };
+    public RoutineProgressStyle BarStyle { get; set; } = new()
+    {
+        Style = ProgressStyle.Solid, Color = "#8FB4FF", Color2 = "#F0FFFFFF", Thickness = 0.20,
+    };
+
+    /// <summary>Face, colour and opacity of the small Hour/Min captions.</summary>
+    public RoutineTextStyle LabelStyle { get; set; } = new()
+    {
+        Color = "#E8E8E8", Color2 = "#8FB4FF", Opacity = 100,
+    };
+}
+
 public sealed class AppConfig
 {
     public List<WallpaperAssignment> Wallpapers { get; set; } = [];
@@ -196,6 +391,7 @@ public sealed class AppConfig
     public double Volume { get; set; } = 0.3;
     public ClockConfig Clock { get; set; } = new();
     public InfoConfig Info { get; set; } = new();
+    public RoutineConfig Routine { get; set; } = new();
     public PauseConfig Pause { get; set; } = new();
 
     public string? WallpaperFor(string monitorDevice)
@@ -220,6 +416,7 @@ public sealed class AppConfig
     UseStringEnumConverter = true,
     DefaultIgnoreCondition = JsonIgnoreCondition.Never)]
 [JsonSerializable(typeof(AppConfig))]
+[JsonSerializable(typeof(RoutineConfig))]
 public sealed partial class ConfigJsonContext : JsonSerializerContext;
 
 public static class ConfigStore
@@ -250,4 +447,83 @@ public static class ConfigStore
         File.WriteAllText(tmp, JsonSerializer.Serialize(config, ConfigJsonContext.Default.AppConfig));
         File.Move(tmp, ConfigPath, overwrite: true);
     }
+}
+
+/// <summary>Named routine layouts on disk, one JSON file each under
+/// %AppData%\FeatherWall\routine-presets. The whole <see cref="RoutineConfig"/> is stored, blocks
+/// and all, because a preset that only carried colours would not be a layout.</summary>
+public static class RoutinePresetStore
+{
+    public static string Directory { get; } =
+        Path.Combine(ConfigStore.ConfigDirectory, "routine-presets");
+
+    public static IReadOnlyList<string> List()
+    {
+        try
+        {
+            if (!System.IO.Directory.Exists(Directory)) return [];
+            return [.. System.IO.Directory.EnumerateFiles(Directory, "*.json")
+                .Select(Path.GetFileNameWithoutExtension)
+                .Where(n => !string.IsNullOrWhiteSpace(n))
+                .Select(n => n!)
+                .OrderBy(n => n, StringComparer.CurrentCultureIgnoreCase)];
+        }
+        catch (Exception ex)
+        {
+            Common.Log.Warn($"Routine presets unreadable ({ex.Message})");
+            return [];
+        }
+    }
+
+    public static bool Save(string name, RoutineConfig config)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(Directory);
+            var tmp = PathFor(name) + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(config, ConfigJsonContext.Default.RoutineConfig));
+            File.Move(tmp, PathFor(name), overwrite: true);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Common.Log.Warn($"Saving routine preset '{name}' failed ({ex.Message})");
+            return false;
+        }
+    }
+
+    public static RoutineConfig? Load(string name)
+    {
+        try
+        {
+            var path = PathFor(name);
+            if (!File.Exists(path)) return null;
+            return JsonSerializer.Deserialize(File.ReadAllText(path), ConfigJsonContext.Default.RoutineConfig);
+        }
+        catch (Exception ex)
+        {
+            Common.Log.Warn($"Loading routine preset '{name}' failed ({ex.Message})");
+            return null;
+        }
+    }
+
+    /// <summary>Template is replaced before this is called, so the name is already known to be a
+    /// bare file name with no separators.</summary>
+    public static bool Delete(string name)
+    {
+        try
+        {
+            var path = PathFor(name);
+            if (!File.Exists(path)) return false;
+            File.Delete(path);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Common.Log.Warn($"Deleting routine preset '{name}' failed ({ex.Message})");
+            return false;
+        }
+    }
+
+    private static string PathFor(string name) => Path.Combine(Directory, name + ".json");
 }

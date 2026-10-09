@@ -48,6 +48,19 @@ public static class Kernel32
     public const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
 }
 
+/// <summary>winmm's timer resolution. Windows drives every waitable timer and Thread.Sleep off the
+/// system clock tick, which is 15.6 ms unless somebody asks for finer — so a 16 ms animation
+/// interval lands on a granularity coarser than itself and the frames come out unevenly spaced
+/// however exact the schedule is. Asking for 1 ms is what makes a 60 Hz schedule actually 60 Hz.</summary>
+public static class Winmm
+{
+    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    public static extern uint TimeBeginPeriod(uint milliseconds);
+
+    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    public static extern uint TimeEndPeriod(uint milliseconds);
+}
+
 public static class WtsApi32
 {
     [DllImport("wtsapi32.dll", SetLastError = true)]

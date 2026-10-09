@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Drawing;
 using System.Text;
 using FeatherWall.Common;
 using FeatherWall.Config;
@@ -35,6 +36,12 @@ public sealed class Engine : IDisposable
     private InfoOverlay? _info;
     private HaloOverlay? _halo;
     private NowPlayingOverlay? _record;
+    private RoutineOverlay? _routine;
+
+    /// <summary>The routine background last pushed to a wallpaper window. Tracked so a colour or
+    /// hour tweak in the settings panel costs a repaint, and only an actual picture change costs
+    /// a full re-apply of every monitor's wallpaper.</summary>
+    private string? _routineBackground;
 
     /// <summary>Which monitor the record lives on. Pause events arrive per monitor, and without
     /// this a second display going behind a window would stop a record on the first.</summary>
@@ -44,6 +51,15 @@ public sealed class Engine : IDisposable
     private PlaybackMonitor? _playback;
     private bool _reapplying;
     private string _originalWallpaper = "";
+
+    /// <summary>The two states in which the desktop is not being looked at, and the derived answer.
+    /// Kept apart because they overlap in both orders — the panel can come back while the session is
+    /// still locked, and the session can unlock with the panel still dark — and rendering must not
+    /// restart behind whichever one is still on. Sleep needs no third flag: the panel has gone dark
+    /// by then, and the machine is frozen for the rest of it.</summary>
+    private bool _displayOff;
+    private bool _sessionLocked;
+    private bool _idle;
 
     private static string StaticDir => Path.Combine(Log.Directory, "static");
     private static string OriginalWallpaperFile => Path.Combine(Log.Directory, "original-wallpaper.txt");
@@ -99,7 +115,38 @@ public sealed class Engine : IDisposable
                 Log.Error($"Failed to apply wallpaper on {monitor.Device}", ex);
             }
         }
+
+        // The routine preset may own its monitor's picture. Applied after the assignments above
+        // so it wins, and before the widgets so the blocks land on the right image.
+        if (_config.Routine.Enabled && !string.IsNullOrWhiteSpace(_config.Routine.BackgroundImage))
+        {
+            var target = ResolveRoutineMonitor();
+            if (target is not null)
+            {
+                if (File.Exists(_config.Routine.BackgroundImage))
+                {
+                    try { ApplyToMonitor(target, _config.Routine.BackgroundImage); }
+                    catch (Exception ex) { Log.Error("Routine background failed", ex); }
+                }
+                else
+                {
+                    Log.Warn($"Routine background missing: {_config.Routine.BackgroundImage}");
+                }
+            }
+        }
+        _routineBackground = _config.Routine.Enabled ? _config.Routine.BackgroundImage : null;
+
         RecreateWidgets();
+    }
+
+    /// <summary>The monitor the routine preset lives on — configured device, else primary, else
+    /// the first one, exactly as the clock and info widget resolve theirs.</summary>
+    private MonitorInfo? ResolveRoutineMonitor()
+    {
+        var monitors = MonitorTracker.Enumerate();
+        return monitors.FirstOrDefault(m =>
+                   string.Equals(m.Device, _config.Routine.Monitor, StringComparison.OrdinalIgnoreCase))
+            ?? monitors.FirstOrDefault(m => m.Primary) ?? monitors.FirstOrDefault();
     }
 
     private void ApplyToMonitor(MonitorInfo monitor, string path)
@@ -176,7 +223,7 @@ public sealed class Engine : IDisposable
         {
             _config.Assign(monitorDevice, path);
             ConfigStore.Save(_config);
-            if (_clock is null && _info is null && _halo is null && _record is null) RecreateWidgets();
+            if (_clock is null && _info is null && _halo is null && _record is null && _routine is null) RecreateWidgets();
         }
     }
 
@@ -222,11 +269,8 @@ public sealed class Engine : IDisposable
             }}");
 
             if (_playback is { } playback) playback.DisplayOff = off;
-            // Dimmed still shows the wallpaper, so only a true off suspends the clock.
-            _clock?.SetSuspended(off);
-            _info?.SetSuspended(off);
-            _halo?.SetSuspended(off);
-            _record?.SetSuspended(off);
+            _displayOff = off;
+            UpdateIdle();
         }
         else if (setting == PowerNotifications.PowerSavingStatus || setting == PowerNotifications.AcDcPowerSource)
         {
@@ -238,6 +282,41 @@ public sealed class Engine : IDisposable
         // Outside the chain above: the battery source filters for the two settings that can
         // change its text, and an AC transition is one of them, so it must see that branch too.
         _battery?.OnPowerSettingChanged(setting);
+    }
+
+    /// <summary>The session locked or unlocked. The lock screen covers the desktop exactly as the
+    /// panel going dark does — nobody can see the wallpaper either way — so it rides the same idle
+    /// state, and video stops for it through the pause poll as it always has.</summary>
+    private void SetSessionLocked(bool locked)
+    {
+        if (_playback is { } playback) playback.SessionLocked = locked;
+        _sessionLocked = locked;
+        UpdateIdle();
+    }
+
+    /// <summary>Stops every timer that exists only to draw something nobody can see, or to watch
+    /// for a reason to.
+    ///
+    /// Widgets already suspended themselves on a dark panel; what this adds is the same treatment on
+    /// a locked session, and the two things that were still running regardless: the routine's 1 ms
+    /// system-timer request — which raises the tick for the whole machine and keeps it out of its
+    /// deep idle states — and the 500 ms pause poll, which is pointless to keep asking whether a
+    /// foreground window covers a desktop that is not on screen. With both released, an idle
+    /// FeatherWall wakes for nothing but the watchdog's mandated heartbeat.</summary>
+    private void UpdateIdle()
+    {
+        bool idle = _displayOff || _sessionLocked;
+        if (idle == _idle) return;
+        _idle = idle;
+        Log.Info(idle ? "Idle — stopping timers" : "Active — starting timers");
+
+        // Dimmed still shows the wallpaper, so only a true off counts as dark.
+        _clock?.SetSuspended(idle);
+        _info?.SetSuspended(idle);
+        _halo?.SetSuspended(idle);
+        _record?.SetSuspended(idle);
+        _routine?.SetSuspended(idle);
+        _playback?.SetSuspended(idle);
     }
 
     /// <summary>A surface reported DXGI device removal or reset — a GPU driver update, a TDR, or
@@ -297,6 +376,8 @@ public sealed class Engine : IDisposable
             _record?.Dispose();
             _record = null;
             _recordDevice = null;
+            _routine?.Dispose();
+            _routine = null;
             foreach (var window in _windows.Values) window.Dispose();
             _windows.Clear();
             VideoRenderer.ReclaimMediaPipeline(); // disposed players hold their MF threads until collected
@@ -317,6 +398,36 @@ public sealed class Engine : IDisposable
     {
         RecreateClock();
         RecreateInfo();
+        RecreateRoutine();
+    }
+
+    /// <summary>Rebuilds the routine preset's five overlays. Cheap in the same way the clock is —
+    /// five small GDI+ bitmaps and a timer armed on the minute boundary.</summary>
+    private void RecreateRoutine()
+    {
+        _routine?.Dispose();
+        _routine = null;
+        if (!_config.Routine.Enabled) return;
+
+        var target = ResolveRoutineMonitor();
+        if (target is null) return;
+
+        try
+        {
+            if (!_windows.TryGetValue(target.Device, out var window))
+            {
+                window = new WallpaperWindow(target);
+                window.DeviceLost += OnDeviceLost;
+                _host.Attach(window.Hwnd, target.Bounds);
+                window.EnsureHost();
+                _windows[target.Device] = window;
+            }
+            _routine = new RoutineOverlay(window.EnsureHost(), _config.Routine, target);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Routine preset failed", ex);
+        }
     }
 
     /// <summary>Rebuilds the info widget. The sources OUTLIVE it.
@@ -519,6 +630,9 @@ public sealed class Engine : IDisposable
     private const uint CmdPauseFullscreen = 11;
     private const uint CmdPauseBattery = 12;
     private const uint CmdSettings = 13;
+    private const uint CmdEditMode = 14;
+    private const uint CmdRoutineEnabled = 15;
+    private const uint CmdRoutineBackground = 16;
     private const uint CmdFitBase = 20;      // + (int)FitMode
     private const uint CmdAnchorBase = 30;   // + (int)ClockAnchor
     private const uint CmdGalleryBase = 2000;
@@ -565,11 +679,15 @@ public sealed class Engine : IDisposable
             User32.AppendMenuW(clockMenu, MF_POPUP, (nuint)anchorMenu, "Position");
             User32.AppendMenuW(menu, MF_POPUP, (nuint)clockMenu, "Clock");
 
+            User32.AppendMenuW(menu, MF_STRING | (_config.Routine.Enabled ? MF_CHECKED : 0), CmdRoutineEnabled, "Routine preset");
+            User32.AppendMenuW(menu, MF_STRING, CmdRoutineBackground, "Routine background…");
+
             User32.AppendMenuW(pauseMenu, MF_STRING | (_config.Pause.OnFullscreen ? MF_CHECKED : 0), CmdPauseFullscreen, "Pause when a fullscreen app is active");
             User32.AppendMenuW(pauseMenu, MF_STRING | (_config.Pause.OnBatterySaver ? MF_CHECKED : 0), CmdPauseBattery, "Pause on battery saver");
             User32.AppendMenuW(menu, MF_POPUP, (nuint)pauseMenu, "Auto-pause");
 
             User32.AppendMenuW(menu, MF_SEPARATOR, 0, null);
+            User32.AppendMenuW(menu, MF_STRING, CmdEditMode, "Edit layout…");
             User32.AppendMenuW(menu, MF_STRING, CmdSettings, "Settings…");
             User32.AppendMenuW(menu, MF_STRING | (Autostart.IsEnabled() ? MF_CHECKED : 0), CmdAutostart, "Run at startup");
             User32.AppendMenuW(menu, MF_STRING, CmdOpenConfig, "Open config file");
@@ -634,6 +752,16 @@ public sealed class Engine : IDisposable
                 return;
             case CmdSettings:
                 OpenSettings();
+                return;
+            case CmdEditMode:
+                OpenEditMode();
+                return;
+            case CmdRoutineEnabled:
+                _config.Routine.Enabled = !_config.Routine.Enabled;
+                RefreshRoutine();
+                return;
+            case CmdRoutineBackground:
+                PickRoutineBackground();
                 return;
             case CmdAutostart:
                 Autostart.SetEnabled(!Autostart.IsEnabled());
@@ -763,6 +891,24 @@ public sealed class Engine : IDisposable
     /// <summary>Clock appearance changed: persist and rebuild the overlay (cheap).</summary>
     public void RefreshWidgets() => SaveAndRefreshWidgets();
 
+    /// <summary>The routine preset changed. Switching it on or off, or changing the picture it is
+    /// drawn over, has to re-apply the wallpaper; a colour, font or hour tweak only has to repaint,
+    /// and repainting is what keeps the settings panel responsive.</summary>
+    public void RefreshRoutine()
+    {
+        ConfigStore.Save(_config);
+        bool enabled = _config.Routine.Enabled;
+        string? wanted = enabled ? _config.Routine.BackgroundImage : null;
+
+        if (enabled != (_routine is not null) ||
+            !string.Equals(wanted, _routineBackground, StringComparison.OrdinalIgnoreCase))
+        {
+            ApplyFromConfig();
+            return;
+        }
+        RefreshWidgetsInPlace();
+    }
+
     /// <summary>For the settings panel's clock and date pages.</summary>
     public void RefreshClock() => SaveAndRefreshClockOnly();
 
@@ -827,6 +973,253 @@ public sealed class Engine : IDisposable
         }
     }
 
+    // ---- edit mode -----------------------------------------------------------------------
+
+    private Tray.EditModeForm? _editForm;
+
+    /// <summary>Opens the layout editor: a full-screen topmost canvas with an outline around
+    /// every widget, where dragging writes the new position straight back into config.
+    ///
+    /// Deliberately a mode rather than always-on: the widgets are click-through, and this window
+    /// is not — while it is up, the desktop behind it cannot be used.</summary>
+    public void OpenEditMode()
+    {
+        try
+        {
+            if (_editForm is { IsDisposed: false })
+            {
+                _editForm.Activate();
+                return;
+            }
+            Log.Info("Opening edit mode");
+            var form = new Tray.EditModeForm(BuildEditTargets, SyncWidgetLayout, PickRoutineBackground);
+            // Shown, not shown modally. FeatherWall pumps messages with its own GetMessage loop
+            // rather than Application.Run, and a ShowDialog on that thread installs a second
+            // nested loop that never delivers WM_PAINT to a layered window — the canvas stayed
+            // invisible yet hit-testable and the desktop stayed swallowed after it closed.
+            form.FormClosed += (_, _) =>
+            {
+                _editForm = null;
+                ConfigStore.Save(_config);
+                // Rebuilt rather than resumed: the overlays come back live at the edited layout, so
+                // the animation the freeze below stopped does not need switching back on.
+                RecreateWidgets(); // sizes may have moved; rebuild once, not per drag frame
+                form.Dispose();
+            };
+            _editForm = form;
+            // Freeze the ring and the day bar while the layout is being arranged. They are still
+            // on screen and still move with the drags — SyncWidgetLayout repaints on demand — but a
+            // 30 Hz timer rendering six Direct2D surfaces underneath a drag is work nobody can see.
+            // Closing the editor rebuilds them, which is what restarts the animation.
+            _routine?.PauseAnimation();
+            form.Show();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Edit mode failed", ex);
+            _tray?.ShowBalloon("Edit mode failed", ex.Message);
+        }
+    }
+
+    /// <summary>Repaints every widget where it stands — what a settings tweak needs. Rebuilding
+    /// the overlays instead would dispose and recreate the media sources dozens of times a
+    /// second.</summary>
+    private void RefreshWidgetsInPlace()
+    {
+        _clock?.Refresh();
+        _info?.Refresh();
+        _halo?.Refresh();
+        _record?.Refresh();
+        _routine?.Refresh();
+    }
+
+    /// <summary>What the canvas calls while a box is being dragged.
+    ///
+    /// The routine blocks are moved without being repainted: six GDI+ renders through Direct2D
+    /// per dragged pixel is what made the canvas stutter, and the pictures are already drawn. The
+    /// other widgets each own a single small bitmap and are cheap enough to rebuild outright.
+    /// Anything that changes how a block looks — the settings pages — goes through
+    /// <see cref="RefreshRoutine"/> and still repaints.</summary>
+    private void SyncWidgetLayout()
+    {
+        _clock?.Refresh();
+        _info?.Refresh();
+        _halo?.Refresh();
+        _record?.Refresh();
+        _routine?.SyncLayout();
+    }
+
+    /// <summary>The draggable blocks edit mode offers. Routine blocks can be resized; the clock,
+    /// the info widget, the halo and the record can be dragged but not resized, because their
+    /// size comes from a font size or a diameter the settings pages already own and mapping a
+    /// rectangle back onto those would be a guess.</summary>
+    private IReadOnlyList<Tray.EditTarget> BuildEditTargets()
+    {
+        var targets = new List<Tray.EditTarget>();
+        // Enumerated once per rebuild. The canvas asks for the list on every paint, and this is a
+        // Win32 display enumeration, not a loop over an array.
+        var monitors = MonitorTracker.Enumerate();
+
+        void Add(string key, string label, Rectangle bounds, bool resizable, Action<Rectangle> apply)
+        {
+            if (bounds.Width <= 0 || bounds.Height <= 0) return;
+            targets.Add(new Tray.EditTarget
+            {
+                Key = key, Label = label, Bounds = bounds, Resizable = resizable, Apply = apply,
+            });
+        }
+
+        /// <summary>Routine blocks can also be tilted; the clock and the other widgets cannot,
+        /// because their angle is not something their own config pages can express.</summary>
+        void AddRoutine(string key, string label, Rectangle bounds, double rotation)
+        {
+            if (bounds.Width <= 0 || bounds.Height <= 0) return;
+            targets.Add(new Tray.EditTarget
+            {
+                Key = key, Label = label, Bounds = bounds, Resizable = true,
+                Rotation = rotation,
+                Apply = rect => ApplyRoutineRect(key, rect),
+                ApplyRotation = angle => ApplyRoutineRotation(key, angle),
+            });
+        }
+
+        WidgetPlacement? Place(Rectangle rect, bool workArea)
+        {
+            var monitor = MonitorAt(monitors, rect);
+            if (monitor is null) return null;
+            return ClockLayout.ToPlacement(workArea ? monitor.WorkArea : monitor.Bounds, rect.Left, rect.Top);
+        }
+
+        if (_routine is { } routine)
+            foreach (var (key, label, bounds, rotation) in routine.DescribeParts())
+                AddRoutine(key, label, bounds, rotation);
+
+        if (_clock is { } clock)
+            Add("clock", "时钟", clock.ScreenBounds, false, rect => _config.Clock.Placement = Place(rect, true));
+
+        if (_info is { } info)
+            Add("info", "信息挂件", info.ScreenBounds, false, rect => _config.Info.Placement = Place(rect, true));
+
+        if (_halo is { } halo)
+            Add("halo", "电量环", halo.ScreenBounds, false, rect => _config.Info.Halo.FreePlacement = Place(rect, true));
+
+        if (_record is { } record)
+            Add("record", "唱片", record.ScreenBounds, false, rect => _config.Info.Disc.Placement = Place(rect, true));
+
+        return targets;
+    }
+
+    /// <summary>The monitor a widget sits on, found from its own rectangle — the overlays do not
+    /// publish their monitor, and a widget whose outline straddles two displays is not a case
+    /// worth threading a reference through four files for.</summary>
+    private static MonitorInfo? MonitorAt(IReadOnlyList<MonitorInfo> monitors, Rectangle bounds)
+    {
+        int cx = bounds.Left + bounds.Width / 2;
+        int cy = bounds.Top + bounds.Height / 2;
+        return monitors.FirstOrDefault(m =>
+                   cx >= m.Bounds.Left && cx < m.Bounds.Right && cy >= m.Bounds.Top && cy < m.Bounds.Bottom)
+            ?? monitors.FirstOrDefault();
+    }
+
+    /// <summary>Writes a dragged routine block back as fractions of the monitor. The key is the
+    /// overlay key the routine itself uses, so the two cannot drift apart.</summary>
+    private void ApplyRoutineRect(string key, Rectangle rect)
+    {
+        var part = RoutinePartFor(key);
+        if (part is null) return;
+
+        var monitor = MonitorAt(MonitorTracker.Enumerate(), rect) ?? ResolveRoutineMonitor();
+        if (monitor is null) return;
+        var area = monitor.Bounds;
+        if (area.Width <= 0 || area.Height <= 0) return;
+
+        part.X = (double)(rect.Left - area.Left) / area.Width;
+        part.Y = (double)(rect.Top - area.Top) / area.Height;
+        part.W = Math.Max((double)rect.Width / area.Width, 0.002);
+        part.H = Math.Max((double)rect.Height / area.Height, 0.002);
+    }
+
+    /// <summary>The rotation drag on the canvas writes straight to the block's angle — the box
+    /// does not move, so there is nothing to map through the monitor.</summary>
+    private void ApplyRoutineRotation(string key, double degrees)
+    {
+        if (RoutinePartFor(key) is { } part) part.Rotation = degrees;
+    }
+
+    private RoutinePart? RoutinePartFor(string key) => key switch
+    {
+        "routine.hour" => _config.Routine.Hour,
+        "routine.minute" => _config.Routine.Minute,
+        "routine.hourLabel" => _config.Routine.HourLabel,
+        "routine.minLabel" => _config.Routine.MinuteLabel,
+        "routine.ring" => _config.Routine.Ring,
+        "routine.bar" => _config.Routine.Bar,
+        _ => null,
+    };
+
+    /// <summary>Picks the picture the routine preset is drawn over. Also switches the preset on,
+    /// because choosing a background and having nothing appear is the worse outcome.</summary>
+    public void PickRoutineBackground()
+    {
+        try
+        {
+            // The canvas is topmost across the whole desktop, so it would sit over the picker's
+            // own window. Drop it for the duration and put it back afterwards.
+            bool topmost = _editForm?.TopMost ?? false;
+            if (_editForm is not null) _editForm.TopMost = false;
+            string? path;
+            try { path = FilePicker.PickMedia(_messageWindow?.Hwnd ?? IntPtr.Zero); }
+            finally { if (_editForm is { IsDisposed: false }) _editForm.TopMost = topmost; }
+
+            if (path is null) return;
+            _config.Routine.BackgroundImage = path;
+            _config.Routine.Enabled = true;
+            RefreshRoutine();
+            _editForm?.Repaint();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Choosing a routine background failed", ex);
+        }
+    }
+
+    /// <summary>The named routine layouts on disk, for the settings page's preset row.</summary>
+    public IReadOnlyList<string> RoutinePresets() => RoutinePresetStore.List();
+
+    /// <summary>Stores the whole routine config under <paramref name="name"/>. The name is
+    /// sanitised rather than trusted: it arrives from a text box and becomes a file name.</summary>
+    public bool SaveRoutinePreset(string name)
+    {
+        var safe = Sanitise(name);
+        if (safe.Length == 0) return false;
+        if (!RoutinePresetStore.Save(safe, _config.Routine))
+        {
+            _tray?.ShowBalloon("Routine preset", "Could not save the preset.");
+            return false;
+        }
+        Log.Info($"Routine preset saved: {safe}");
+        return true;
+    }
+
+    public bool LoadRoutinePreset(string name)
+    {
+        if (RoutinePresetStore.Load(name) is not { } preset) return false;
+        _config.Routine = preset;
+        RefreshRoutine();
+        _editForm?.Repaint();
+        Log.Info($"Routine preset loaded: {name}");
+        return true;
+    }
+
+    public bool DeleteRoutinePreset(string name) => RoutinePresetStore.Delete(name);
+
+    private static string Sanitise(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var cleaned = new string([.. name.Trim().Where(c => !invalid.Contains(c))]);
+        return cleaned.Length > 64 ? cleaned[..64] : cleaned;
+    }
+
     private void ApplyGalleryEntry(GalleryEntry entry)
     {
         if (_gallery.LocalPathIfDownloaded(entry) is { } cached)
@@ -862,7 +1255,7 @@ public sealed class Engine : IDisposable
         sb.AppendLine($"Progman: 0x{layer.Progman:X}  WorkerW: 0x{layer.WorkerW:X}  DefView: 0x{layer.DefView:X}");
         foreach (var monitor in MonitorTracker.Enumerate())
             sb.AppendLine($"Monitor {monitor.Device}: {monitor.Bounds}{(monitor.Primary ? " (primary)" : "")}");
-        sb.AppendLine($"Attached surfaces: {_windows.Count}   Clock: {(_clock is null ? "off" : "on")}   Info: {(_info is null ? "off" : "on")}   Halo: {(_halo is null ? "attached/off" : "detached")}   Record: {(_record is null ? "off" : "on")}");
+        sb.AppendLine($"Attached surfaces: {_windows.Count}   Clock: {(_clock is null ? "off" : "on")}   Info: {(_info is null ? "off" : "on")}   Halo: {(_halo is null ? "attached/off" : "detached")}   Record: {(_record is null ? "off" : "on")}   Routine: {(_routine is null ? "off" : "on")}");
         sb.AppendLine($"Config: {ConfigStore.ConfigPath}");
         sb.AppendLine($"Log: {Path.Combine(Log.Directory, "featherwall.log")}");
         return sb.ToString();
@@ -914,14 +1307,11 @@ public sealed class Engine : IDisposable
                     _engine.RunOnMainThread(_engine.ReapplyAll);
                     return IntPtr.Zero;
                 case WM_WTSSESSION_CHANGE:
-                    if (_engine._playback is { } playback)
+                    if ((int)wParam == WTS_SESSION_LOCK) _engine.SetSessionLocked(true);
+                    else if ((int)wParam == WTS_SESSION_UNLOCK)
                     {
-                        if ((int)wParam == WTS_SESSION_LOCK) playback.SessionLocked = true;
-                        else if ((int)wParam == WTS_SESSION_UNLOCK)
-                        {
-                            playback.SessionLocked = false;
-                            _engine._host.ValidateLayer();
-                        }
+                        _engine.SetSessionLocked(false);
+                        _engine._host.ValidateLayer();
                     }
                     return IntPtr.Zero;
                 case WM_POWERBROADCAST when (int)wParam == PBT_APMRESUMEAUTOMATIC:
@@ -935,6 +1325,7 @@ public sealed class Engine : IDisposable
                     _engine._info?.Refresh();
                     _engine._halo?.Refresh();
                     _engine._record?.Refresh();
+                    _engine._routine?.Refresh();
                     _engine._host.ValidateLayer();
                     return IntPtr.Zero;
                 case WM_POWERBROADCAST when (int)wParam == PBT_POWERSETTINGCHANGE:

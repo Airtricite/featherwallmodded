@@ -14,6 +14,16 @@ internal static class Program
         if (args.Contains("--diag"))
             return RunDiagnostics();
 
+        // Handled before the singleton mutex: the guard is not a second instance of the app, and
+        // taking the lock here would make the app it guards refuse to start.
+        int watchdogArg = Array.IndexOf(args, "--watchdog");
+        if (watchdogArg >= 0)
+        {
+            return watchdogArg + 1 < args.Length && int.TryParse(args[watchdogArg + 1], out int watched)
+                ? Watchdog.Run(watched)
+                : 0;
+        }
+
         if (args.Contains("--exit"))
         {
             var running = User32.FindWindowW("FeatherWallMessage", null);
@@ -58,6 +68,11 @@ internal static class Program
         {
             engine = new Engine(ConfigStore.Load());
             engine.Start();
+
+            // After Start(), so the guard's first heartbeat has a window to reach. A guard that
+            // relaunched us passes --no-watchdog: it is already the guard.
+            if (!args.Contains("--no-watchdog"))
+                Watchdog.EnsureRunning();
 
             if (args.Contains("--settings"))
                 engine.OpenSettings();

@@ -35,6 +35,26 @@ public static class ClockLayout
         return new POINT { X = x, Y = y };
     }
 
+    /// <summary>Top-left position from a placement written by edit mode, or null when the widget
+    /// is still anchor-positioned. Fractions of the work area, so nothing needs to know DPI.</summary>
+    public static POINT? FreePosition(in RECT area, WidgetPlacement? placement)
+    {
+        if (placement is null) return null;
+        return new POINT
+        {
+            X = area.Left + (int)Math.Round(placement.X * area.Width),
+            Y = area.Top + (int)Math.Round(placement.Y * area.Height),
+        };
+    }
+
+    /// <summary>The inverse: a screen rectangle back to placement fractions, for edit mode to
+    /// persist a dragged position.</summary>
+    public static WidgetPlacement ToPlacement(in RECT area, int screenX, int screenY) => new()
+    {
+        X = area.Width > 0 ? (double)(screenX - area.Left) / area.Width : 0,
+        Y = area.Height > 0 ? (double)(screenY - area.Top) / area.Height : 0,
+    };
+
     public static string TimeText(DateTime now, bool twentyFourHour, bool showSeconds)
     {
         string format = (twentyFourHour, showSeconds) switch

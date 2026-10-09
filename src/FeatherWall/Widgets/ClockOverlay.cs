@@ -30,6 +30,10 @@ public sealed class ClockOverlay : IDisposable
     private bool _disposed;
     private bool _suspended;
 
+    /// <summary>Where the widget actually landed on screen, in virtual-screen pixels. Reported
+    /// so edit mode can outline and hit-test the widget without re-measuring it.</summary>
+    public Rectangle ScreenBounds { get; private set; }
+
     /// <summary><paramref name="dpiScale"/> is this monitor's DPI relative to the primary's, so
     /// it is 1.0 on a single-DPI machine and the widget renders exactly as it did in v0.1.0.</summary>
     public ClockOverlay(CompositionHost host, ClockConfig config, MonitorInfo monitor, double dpiScale = 1.0)
@@ -114,11 +118,13 @@ public sealed class ClockOverlay : IDisposable
             // Overlay offsets are relative to the wallpaper window, whose origin is the
             // monitor's top-left. Margins scale with the monitor so the widget keeps the same
             // physical inset on a display with a different DPI.
-            var screenPos = ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, _config.Anchor,
-                ClockLayout.ScaleMargin(_config.MarginLeft ?? _config.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(_config.MarginTop ?? _config.MarginY, _dpiScale),
-                ClockLayout.ScaleMargin(_config.MarginRight ?? _config.MarginX, _dpiScale),
-                ClockLayout.ScaleMargin(_config.MarginBottom ?? _config.MarginY, _dpiScale));
+            var screenPos = ClockLayout.FreePosition(_monitor.WorkArea, _config.Placement)
+                ?? ClockLayout.Position(_monitor.WorkArea, size.Cx, size.Cy, _config.Anchor,
+                    ClockLayout.ScaleMargin(_config.MarginLeft ?? _config.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(_config.MarginTop ?? _config.MarginY, _dpiScale),
+                    ClockLayout.ScaleMargin(_config.MarginRight ?? _config.MarginX, _dpiScale),
+                    ClockLayout.ScaleMargin(_config.MarginBottom ?? _config.MarginY, _dpiScale));
+            ScreenBounds = new Rectangle(screenPos.X, screenPos.Y, size.Cx, size.Cy);
             int offsetX = screenPos.X - _monitor.Bounds.Left;
             int offsetY = screenPos.Y - _monitor.Bounds.Top;
 
